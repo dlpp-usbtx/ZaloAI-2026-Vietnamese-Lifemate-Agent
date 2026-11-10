@@ -1,0 +1,9 @@
+# Kaggle provides torch, torchaudio, CUDA, and the matching GPU driver.
+# Install the CUDA-enabled sherpa-onnx wheel separately as described in README.md.
+transformers>=4.45.0,<4.49.0
+peft>=0.20.0,<1
+accelerate>=0.29.3
+torchao>=0.16.0
+pydantic>=2.7.1
+dateparser>=1.2.0
+PyYAML>=6.0.1

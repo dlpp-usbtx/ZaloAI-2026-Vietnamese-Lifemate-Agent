@@ -1,0 +1,27 @@
+model_name_or_path: "Qwen/Qwen2.5-3B-Instruct"
+max_seq_length: 2048
+output_dir: "./checkpoint_sft_final"
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+training:
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0002
+  num_train_epochs: 3
+  warmup_ratio: 0.03
+  logging_steps: 10
+  save_strategy: "epoch"
+  evaluation_strategy: "epoch"
+  save_total_limit: 2

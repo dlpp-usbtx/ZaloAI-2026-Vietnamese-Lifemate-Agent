@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+
+data/processed/
+outputs/
+checkpoint_sft_final/
+lifemate_sft_export/
+*.zip
+submission*.jsonl

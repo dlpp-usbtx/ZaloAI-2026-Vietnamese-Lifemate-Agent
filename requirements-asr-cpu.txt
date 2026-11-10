@@ -1,0 +1,2 @@
+# Use the CUDA-enabled wheel described in README.md for GPU inference.
+sherpa-onnx>=2.0.1
