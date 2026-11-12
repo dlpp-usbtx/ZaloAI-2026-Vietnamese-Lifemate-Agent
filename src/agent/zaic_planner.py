@@ -88,7 +88,7 @@ class ZAICAgentPlanner:
             }
         )
 
-        max_turns = 5
+        max_turns = 3
         execution_failed = False
 
         for turn in range(max_turns):
