@@ -90,6 +90,7 @@ def test_main_writes_performance_log_separately_from_submission(
     class FakeLLMEngine:
         device = "cpu"
         model_dtype = "torch.float32"
+        attention_implementation = "sdpa"
         max_input_tokens = 8192
         max_new_tokens = 256
 

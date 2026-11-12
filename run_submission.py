@@ -101,6 +101,12 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-llm-calls",
+        type=int,
+        default=2,
+        help="Maximum total LLM generate calls for each sample.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Append missing samples to an existing output file.",
@@ -120,6 +126,8 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.max_llm_calls < 1:
+        raise ValueError("--max-llm-calls must be greater than zero.")
     performance_log = args.performance_log or args.output.with_name(
         f"{args.output.stem}.performance.jsonl"
     )
@@ -171,6 +179,7 @@ def main() -> None:
         f"llm_load_seconds={llm_load_seconds:.3f}; "
         f"asr_device={asr_engine.device}; llm_device={llm_engine.device}; "
         f"llm_dtype={llm_engine.model_dtype}; "
+        f"attention={llm_engine.attention_implementation}; "
         f"max_input_tokens={llm_engine.max_input_tokens}; "
         f"max_new_tokens={llm_engine.max_new_tokens}",
         flush=True,
@@ -179,7 +188,10 @@ def main() -> None:
         split_dir / f"{args.split}_tools_catalog.json"
     )
     planner = ZAICAgentPlanner(
-        llm_engine, catalog_manager, asr_engine=asr_engine
+        llm_engine,
+        catalog_manager,
+        asr_engine=asr_engine,
+        max_llm_calls=args.max_llm_calls,
     )
 
     tools_directory = str(split_dir)

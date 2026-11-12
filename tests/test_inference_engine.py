@@ -78,6 +78,11 @@ def test_engine_loads_adapter_on_its_configured_base(tmp_path, monkeypatch):
         lambda path, **kwargs: tokenizer_calls.append((path, kwargs)) or tokenizer,
     )
     monkeypatch.setattr(
+        engine,
+        "build_token_enforcer_tokenizer_data",
+        lambda value: ("tokenizer-data", value),
+    )
+    monkeypatch.setattr(
         engine.AutoModelForCausalLM,
         "from_pretrained",
         lambda path, **kwargs: base_model_calls.append((path, kwargs)) or base_model,
@@ -96,6 +101,8 @@ def test_engine_loads_adapter_on_its_configured_base(tmp_path, monkeypatch):
     assert adapter_model.evaluated
     assert tokenizer_calls[0][0] == str(adapter_dir)
     assert base_model_calls[0][0] == "Qwen/Qwen2.5-3B-Instruct"
+    assert base_model_calls[0][1]["attn_implementation"] == "sdpa"
+    assert loaded._format_enforcer_tokenizer_data == ("tokenizer-data", tokenizer)
     assert adapter_calls == [
         (base_model, str(adapter_dir), {"is_trainable": False})
     ]
@@ -134,13 +141,22 @@ def test_tokenizer_metadata_is_patched_in_temporary_copy(tmp_path):
     ) == original_config
 
 
-def test_generate_trims_old_messages_and_keeps_system_and_user_requests():
+def test_generate_trims_old_messages_and_keeps_system_and_user_requests(
+    monkeypatch,
+):
     llm_engine = engine.HuggingFaceEngine.__new__(engine.HuggingFaceEngine)
     llm_engine.device = "cpu"
     llm_engine.max_input_tokens = 8
     llm_engine.max_new_tokens = 256
     llm_engine.tokenizer = MockTokenizer()
     llm_engine.model = GeneratingMockModel()
+    llm_engine._format_enforcer_tokenizer_data = object()
+    prefix_callback = object()
+    monkeypatch.setattr(
+        engine,
+        "build_transformers_prefix_allowed_tokens_fn",
+        lambda tokenizer_data, parser: prefix_callback,
+    )
     messages = [
         {"role": "system", "content": "system prompt"},
         {"role": "user", "content": "old history request"},
@@ -171,6 +187,11 @@ def test_generate_trims_old_messages_and_keeps_system_and_user_requests():
     assert llm_engine.last_generation_stats["prepare_seconds"] >= 0
     assert llm_engine.last_generation_stats["decode_seconds"] >= 0
     assert llm_engine.last_generation_stats["device"] == "cpu"
+    assert llm_engine.model.generation_kwargs["use_cache"] is True
+    assert (
+        llm_engine.model.generation_kwargs["prefix_allowed_tokens_fn"]
+        is prefix_callback
+    )
 
 
 def test_generate_fails_when_required_messages_exceed_prompt_limit():
@@ -192,3 +213,32 @@ def test_generate_fails_when_required_messages_exceed_prompt_limit():
         assert "Required system and user messages exceed" in str(error)
     else:
         raise AssertionError("Expected required messages to exceed prompt limit.")
+
+
+def test_json_response_schema_accepts_both_training_actions():
+    def parse_schema_response(response):
+        current_parser = engine._create_response_parser()
+        for character in response:
+            current_parser = current_parser.add_character(character)
+        return current_parser.can_end()
+
+    assert parse_schema_response(
+        json.dumps(
+            {
+                "thought": "Thực thi bước 1.",
+                "action": "call_tool",
+                "tool_call": {"name": "calendar.create", "arguments": {}},
+            },
+            ensure_ascii=False,
+        )
+    )
+    assert parse_schema_response(
+        json.dumps(
+            {
+                "thought": "Hoàn tất các bước.",
+                "action": "final_response",
+                "content": "Đã thực hiện xong.",
+            },
+            ensure_ascii=False,
+        )
+    )

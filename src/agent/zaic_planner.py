@@ -11,10 +11,19 @@ from typing import Dict, Any, List, Tuple
 from src.tools.catalog_manager import CatalogManager
 
 class ZAICAgentPlanner:
-    def __init__(self, llm_engine, catalog_manager: CatalogManager, asr_engine=None):
+    def __init__(
+        self,
+        llm_engine,
+        catalog_manager: CatalogManager,
+        asr_engine=None,
+        max_llm_calls: int = 6,
+    ):
+        if max_llm_calls < 1:
+            raise ValueError("max_llm_calls must be greater than zero.")
         self.llm_engine = llm_engine
         self.catalog_manager = catalog_manager
         self.asr_engine = asr_engine
+        self.max_llm_calls = max_llm_calls
         self.last_schema_errors: List[Dict[str, Any]] = []
         self.last_performance_stats: Dict[str, Any] = {}
 
@@ -27,13 +36,22 @@ class ZAICAgentPlanner:
 
             json_str = output_text[start_idx:end_idx]
             data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return False, {}, "Output JSON phải là một object."
 
             if "action" not in data:
                 return False, {}, "Thiếu trường 'action' trong JSON."
+            if data["action"] not in {"call_tool", "final_response"}:
+                return False, {}, "Trường 'action' không hợp lệ."
 
             if data["action"] == "call_tool":
-                if "tool_call" not in data or "name" not in data["tool_call"]:
+                tool_call = data.get("tool_call")
+                if not isinstance(tool_call, dict) or not isinstance(
+                    tool_call.get("name"), str
+                ):
                     return False, {}, "Thiếu trường 'tool_call.name' khi action = 'call_tool'."
+                if not isinstance(tool_call.get("arguments", {}), dict):
+                    return False, {}, "Trường 'tool_call.arguments' phải là object."
 
             return True, data, "Valid"
         except Exception as e:
@@ -63,13 +81,9 @@ class ZAICAgentPlanner:
             f"Vị trí hiện tại: {current_location}\n"
             f"Thông tin người dùng: {json.dumps(user_profile, ensure_ascii=False, separators=(',', ':'))}\n\n"
             f"Danh sách Tools khả dụng:\n{json.dumps(available_tools, ensure_ascii=False, separators=(',', ':'))}\n\n"
-            f"Hãy suy luận và phản hồi theo đúng định dạng JSON duy nhất:\n"
-            f"{{\n"
-            f'  "thought": "Suy luận...",\n'
-            f'  "action": "call_tool" HOẶC "final_response",\n'
-            f'  "tool_call": {{"name": "tên_tool", "arguments": {{...}}}},\n'
-            f'  "content": "Câu trả lời nếu action = final_response"\n'
-            f"}}\n"
+            f"Chỉ trả JSON thuần, không markdown; thought viết ngắn. Dùng đúng một dạng:\n"
+            f'{{"thought":"...","action":"call_tool","tool_call":{{"name":"...","arguments":{{}}}}}}\n'
+            f'{{"thought":"...","action":"final_response","content":"..."}}'
         )
 
         messages = [{"role": "system", "content": system_prompt}]
@@ -100,34 +114,45 @@ class ZAICAgentPlanner:
 
         max_turns = 3
         execution_failed = False
+        llm_call_budget_reached = False
 
         for turn in range(max_turns):
+            if len(llm_call_stats) >= self.max_llm_calls:
+                llm_call_budget_reached = True
+                break
             turns_executed = turn + 1
             retry_count = 0
             max_retries = 2
+            turn_attempts = 0
             parsed_data = None
             is_valid = False
 
-            while retry_count < max_retries:
+            while (
+                retry_count < max_retries
+                and len(llm_call_stats) < self.max_llm_calls
+            ):
                 call_started = time.perf_counter()
                 raw_output = self.llm_engine.generate(messages)
                 call_seconds = time.perf_counter() - call_started
+                turn_attempts += 1
                 engine_stats = getattr(
                     self.llm_engine, "last_generation_stats", {}
                 )
-                llm_call_stats.append(
-                    {
-                        "turn": turn + 1,
-                        "retry": retry_count + 1,
-                        "call_seconds": call_seconds,
-                        "engine": (
-                            dict(engine_stats)
-                            if isinstance(engine_stats, dict)
-                            else {}
-                        ),
-                    }
-                )
+                call_stats = {
+                    "turn": turn + 1,
+                    "retry": retry_count + 1,
+                    "call_seconds": call_seconds,
+                    "engine": (
+                        dict(engine_stats)
+                        if isinstance(engine_stats, dict)
+                        else {}
+                    ),
+                }
+                llm_call_stats.append(call_stats)
                 is_valid, parsed_data, err_msg = self.parse_llm_output_strict(raw_output)
+                call_stats["json_valid"] = is_valid
+                if not is_valid:
+                    call_stats["format_error"] = err_msg
 
                 if is_valid:
                     break
@@ -137,7 +162,15 @@ class ZAICAgentPlanner:
                 messages.append({"role": "user", "content": f"Lỗi định dạng JSON: {err_msg}. Hãy sửa và trả lại đúng định dạng JSON."})
 
             if not is_valid:
-                print(f"❌ Sample {item.get('id')}: Thất bại khi sinh JSON hợp lệ sau {max_retries} lần thử.")
+                llm_call_budget_reached = (
+                    len(llm_call_stats) >= self.max_llm_calls
+                )
+                print(
+                    f"Sample {item.get('id')}: không sinh được JSON hợp lệ "
+                    f"sau {turn_attempts} lần thử; "
+                    f"llm_call_budget={self.max_llm_calls}.",
+                    flush=True,
+                )
                 execution_failed = True
                 break
 
@@ -181,6 +214,8 @@ class ZAICAgentPlanner:
             "tool_validation_seconds": tool_validation_seconds,
             "tool_execution_seconds": tool_execution_seconds,
             "turns_executed": turns_executed,
+            "max_llm_calls": self.max_llm_calls,
+            "llm_call_budget_reached": llm_call_budget_reached,
             "schema_error_count": len(self.last_schema_errors),
             "tool_call_count": len(tool_calls),
             "llm_calls": llm_call_stats,

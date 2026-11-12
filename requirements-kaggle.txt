@@ -7,3 +7,4 @@ torchao>=0.16.0
 pydantic>=2.7.1
 dateparser>=1.2.0
 PyYAML>=6.0.1
+lm-format-enforcer==0.10.11

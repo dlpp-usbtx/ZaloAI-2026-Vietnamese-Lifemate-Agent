@@ -11,9 +11,63 @@ from pathlib import Path
 import shutil
 import tempfile
 import time
+from lmformatenforcer import JsonSchemaParser
+from lmformatenforcer.characterlevelparser import CharacterLevelParserConfig
+from lmformatenforcer.consts import COMPLETE_ALPHABET
+from lmformatenforcer.integrations.transformers import (
+    build_token_enforcer_tokenizer_data,
+    build_transformers_prefix_allowed_tokens_fn,
+)
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.inference.device import select_compute_device
+
+
+LLM_RESPONSE_SCHEMA = {
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {
+                "thought": {"type": "string"},
+                "action": {"enum": ["call_tool"]},
+                "tool_call": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "arguments": {"type": "object"},
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["thought", "action", "tool_call"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "thought": {"type": "string"},
+                "action": {"enum": ["final_response"]},
+                "content": {"type": "string"},
+            },
+            "required": ["thought", "action", "content"],
+            "additionalProperties": False,
+        },
+    ]
+}
+VIETNAMESE_TEXT_CHARACTERS = "".join(
+    chr(codepoint)
+    for start, end in ((0x00C0, 0x0250), (0x0300, 0x0370), (0x1E00, 0x1F00))
+    for codepoint in range(start, end)
+)
+
+
+def _create_response_parser() -> JsonSchemaParser:
+    config = CharacterLevelParserConfig(
+        alphabet=COMPLETE_ALPHABET + VIETNAMESE_TEXT_CHARACTERS
+    )
+    return JsonSchemaParser(LLM_RESPONSE_SCHEMA, config=config)
+
 
 def set_deterministic_seed(seed: int = 42):
     random.seed(seed)
@@ -41,6 +95,7 @@ class HuggingFaceEngine:
         self.max_input_tokens = max_input_tokens
         self.max_new_tokens = max_new_tokens
         self.last_generation_stats: dict[str, float | int | str] = {}
+        self.attention_implementation = "sdpa"
         is_cuda = self.device.startswith("cuda")
 
         model_directory = Path(model_path)
@@ -67,10 +122,14 @@ class HuggingFaceEngine:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_path, trust_remote_code=True
             )
+            self._format_enforcer_tokenizer_data = (
+                build_token_enforcer_tokenizer_data(self.tokenizer)
+            )
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_path,
                 torch_dtype=model_dtype,
                 device_map=device_map,
+                attn_implementation=self.attention_implementation,
                 trust_remote_code=True,
             )
             self.model = PeftModel.from_pretrained(
@@ -80,15 +139,21 @@ class HuggingFaceEngine:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_path, trust_remote_code=True
             )
+            self._format_enforcer_tokenizer_data = (
+                build_token_enforcer_tokenizer_data(self.tokenizer)
+            )
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=model_dtype,
                 device_map=device_map,
+                attn_implementation=self.attention_implementation,
                 trust_remote_code=True,
             )
         self.model.eval()
         print(
-            f"[LLM] device={self.device} ({device_name}); dtype={self.model_dtype}",
+            f"[LLM] device={self.device} ({device_name}); "
+            f"dtype={self.model_dtype}; "
+            f"attention={self.attention_implementation}",
             flush=True,
         )
 
@@ -215,6 +280,12 @@ class HuggingFaceEngine:
             del messages_to_encode[removable_index]
             dropped_messages += 1
 
+    def _build_prefix_allowed_tokens_fn(self):
+        parser = _create_response_parser()
+        return build_transformers_prefix_allowed_tokens_fn(
+            self._format_enforcer_tokenizer_data, parser
+        )
+
     def generate(self, messages: list) -> str:
         total_started = time.perf_counter()
         prepare_started = time.perf_counter()
@@ -228,13 +299,16 @@ class HuggingFaceEngine:
             torch.cuda.reset_peak_memory_stats(self.device)
 
         generation_started = time.perf_counter()
+        prefix_allowed_tokens_fn = self._build_prefix_allowed_tokens_fn()
         try:
             with torch.inference_mode():
                 generated_ids = self.model.generate(
                     **inputs,
                     max_new_tokens=self.max_new_tokens,
                     do_sample=False,
+                    use_cache=True,
                     pad_token_id=self.tokenizer.eos_token_id,
+                    prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
                 )
         except Exception:
             generation_seconds = time.perf_counter() - generation_started
@@ -273,6 +347,7 @@ class HuggingFaceEngine:
                 if generation_seconds > 0
                 else 0.0
             ),
+            "json_constrained": True,
         }
 
         if is_cuda:

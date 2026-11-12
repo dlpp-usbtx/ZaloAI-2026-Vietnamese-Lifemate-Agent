@@ -73,6 +73,7 @@ python -u run_submission.py \
   --split public_test \
   --output /kaggle/working/submission.jsonl \
   --performance-log /kaggle/working/lifemate_performance.jsonl \
+  --max-llm-calls 2 \
   --resume
 ```
 
@@ -91,6 +92,12 @@ validation/execution times, and GPU memory. Startup model-loading times are
 printed separately. The Kaggle notebook reports sample mean/p95/max, average
 LLM calls per sample, generation latency, and output-token counts after
 inference.
+
+The default two-call budget bounds retries and multi-step tool planning; raise
+`MAX_LLM_CALLS_PER_SAMPLE` in the notebook if validation shows that complex
+multi-tool samples lose accuracy. The LLM uses SDPA attention and constrained
+JSON generation (including Vietnamese text characters) to avoid spending
+extra inference calls repairing invalid output formats.
 
 ## Training and evaluation
 
