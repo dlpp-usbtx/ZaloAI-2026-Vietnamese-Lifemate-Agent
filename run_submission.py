@@ -92,6 +92,15 @@ def _parse_args() -> argparse.Namespace:
         help="Output JSONL path.",
     )
     parser.add_argument(
+        "--performance-log",
+        type=Path,
+        default=None,
+        help=(
+            "Per-sample timing and token metrics JSONL path. "
+            "Defaults beside the submission output."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Append missing samples to an existing output file.",
@@ -111,6 +120,11 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    performance_log = args.performance_log or args.output.with_name(
+        f"{args.output.stem}.performance.jsonl"
+    )
+    if performance_log.resolve() == args.output.resolve():
+        raise ValueError("Performance log path must differ from the submission output.")
     split_dir = get_split_dir(args.split)
     input_path = split_dir / f"{args.split}.jsonl"
     if not input_path.is_file():
@@ -134,17 +148,33 @@ def main() -> None:
 
     remaining = len(items) - len(completed_ids)
     if remaining == 0:
+        performance_log.parent.mkdir(parents=True, exist_ok=True)
+        performance_log.touch(exist_ok=True)
         print(
             f"Submission already complete: {args.output} ({len(completed_ids)} samples).",
             flush=True,
         )
+        print(f"Performance log: {performance_log}", flush=True)
         return
 
     print("Initializing ZipFormer ASR and LLM engines...", flush=True)
+    asr_load_started = time.perf_counter()
     asr_engine = ASREngine()
+    asr_load_seconds = time.perf_counter() - asr_load_started
     model_path = get_inference_model_path(require_sft=True)
     print(f"Loading LLM from: {model_path}", flush=True)
+    llm_load_started = time.perf_counter()
     llm_engine = HuggingFaceEngine(model_path=model_path)
+    llm_load_seconds = time.perf_counter() - llm_load_started
+    print(
+        f"[PERF_SETUP] asr_load_seconds={asr_load_seconds:.3f}; "
+        f"llm_load_seconds={llm_load_seconds:.3f}; "
+        f"asr_device={asr_engine.device}; llm_device={llm_engine.device}; "
+        f"llm_dtype={llm_engine.model_dtype}; "
+        f"max_input_tokens={llm_engine.max_input_tokens}; "
+        f"max_new_tokens={llm_engine.max_new_tokens}",
+        flush=True,
+    )
     catalog_manager = CatalogManager(
         split_dir / f"{args.split}_tools_catalog.json"
     )
@@ -162,54 +192,74 @@ def main() -> None:
         f"already completed: {len(completed_ids)}; remaining: {remaining}.",
         flush=True,
     )
+    performance_log.parent.mkdir(parents=True, exist_ok=True)
+    performance_mode = "a" if output_mode == "a" else "w"
+    print(f"Per-sample performance log: {performance_log}", flush=True)
     with args.output.open(output_mode, encoding="utf-8") as output_file:
-        processed_count = 0
-        for item in items:
-            sample_id = item["id"]
-            if sample_id in completed_ids:
-                continue
+        with performance_log.open(performance_mode, encoding="utf-8") as performance_file:
+            processed_count = 0
+            for item in items:
+                sample_id = item["id"]
+                if sample_id in completed_ids:
+                    continue
 
-            sample_started = time.perf_counter()
-            audio_path = split_dir / item["audio"]
-            if not audio_path.is_file():
-                raise FileNotFoundError(
-                    f"Audio file for {sample_id} not found: {audio_path}"
+                sample_started = time.perf_counter()
+                audio_path = split_dir / item["audio"]
+                if not audio_path.is_file():
+                    raise FileNotFoundError(
+                        f"Audio file for {sample_id} not found: {audio_path}"
+                    )
+
+                print(f"{sample_id}: starting ASR", flush=True)
+                asr_started = time.perf_counter()
+                item["transcribed_text"] = asr_engine.transcribe(str(audio_path))
+                asr_seconds = time.perf_counter() - asr_started
+                print(
+                    f"{sample_id}: ASR completed in "
+                    f"{asr_seconds:.2f}s; starting LLM",
+                    flush=True,
                 )
 
-            print(f"{sample_id}: starting ASR", flush=True)
-            asr_started = time.perf_counter()
-            item["transcribed_text"] = asr_engine.transcribe(str(audio_path))
-            print(
-                f"{sample_id}: ASR completed in "
-                f"{time.perf_counter() - asr_started:.2f}s; starting LLM",
-                flush=True,
-            )
+                environment = ToolEnv(
+                    args.split, sample_id, root=split_dir.parent
+                )
+                tool_calls, state_hash = planner.process_sample(
+                    item, environment, split_dir
+                )
+                sample_seconds = time.perf_counter() - sample_started
+                record = {
+                    "id": sample_id,
+                    "tool_calls": tool_calls,
+                    "state_hash": state_hash,
+                }
+                output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                output_file.flush()
 
-            environment = ToolEnv(
-                args.split, sample_id, root=split_dir.parent
-            )
-            tool_calls, state_hash = planner.process_sample(
-                item, environment, split_dir
-            )
-            record = {
-                "id": sample_id,
-                "tool_calls": tool_calls,
-                "state_hash": state_hash,
-            }
-            output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            output_file.flush()
-            processed_count += 1
-            print(
-                f"{sample_id}: completed in "
-                f"{time.perf_counter() - sample_started:.2f}s "
-                f"({processed_count}/{remaining} this run)",
-                flush=True,
-            )
+                performance_record = {
+                    "id": sample_id,
+                    "asr_seconds": asr_seconds,
+                    "sample_seconds": sample_seconds,
+                    "planner": planner.last_performance_stats,
+                }
+                performance_file.write(
+                    json.dumps(performance_record, ensure_ascii=False) + "\n"
+                )
+                performance_file.flush()
+                processed_count += 1
+                print(
+                    f"[PERF_SAMPLE] id={sample_id}; "
+                    f"seconds={sample_seconds:.3f}; "
+                    f"llm_calls={planner.last_performance_stats['llm_call_count']}; "
+                    f"llm_seconds={planner.last_performance_stats['llm_seconds']:.3f}; "
+                    f"tool_seconds={planner.last_performance_stats['tool_validation_seconds'] + planner.last_performance_stats['tool_execution_seconds']:.3f}; "
+                    f"({processed_count}/{remaining} this run)",
+                    flush=True,
+                )
 
-            del environment, tool_calls, state_hash, record, item
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                del environment, tool_calls, state_hash, record, item
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     completed_ids = _load_completed_ids(args.output, expected_ids)
     missing_ids = expected_ids - completed_ids
@@ -222,6 +272,7 @@ def main() -> None:
         f"Submission complete: {args.output} ({len(completed_ids)} samples).",
         flush=True,
     )
+    print(f"Performance log saved: {performance_log}", flush=True)
 
 
 if __name__ == "__main__":

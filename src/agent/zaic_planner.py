@@ -6,6 +6,7 @@ Xử lý ReAct Loop, History ASR Tracing, Robust JSON Parsing và Retry logic.
 from __future__ import annotations
 import json
 from pathlib import Path
+import time
 from typing import Dict, Any, List, Tuple
 from src.tools.catalog_manager import CatalogManager
 
@@ -15,6 +16,7 @@ class ZAICAgentPlanner:
         self.catalog_manager = catalog_manager
         self.asr_engine = asr_engine
         self.last_schema_errors: List[Dict[str, Any]] = []
+        self.last_performance_stats: Dict[str, Any] = {}
 
     def parse_llm_output_strict(self, output_text: str) -> Tuple[bool, Dict[str, Any], str]:
         try:
@@ -38,7 +40,13 @@ class ZAICAgentPlanner:
             return False, {}, f"JSON Parsing Exception: {str(e)}"
 
     def process_sample(self, item: Dict[str, Any], env, split_dir: Path) -> Tuple[List[Dict[str, Any]], str]:
+        planner_started = time.perf_counter()
         self.last_schema_errors = []
+        llm_call_stats = []
+        history_asr_seconds = 0.0
+        tool_validation_seconds = 0.0
+        tool_execution_seconds = 0.0
+        turns_executed = 0
         context = item.get("context", {})
         user_profile = context.get("user_profile", {})
         current_location = context.get("location") or user_profile.get("home_address", "Không xác định")
@@ -74,7 +82,9 @@ class ZAICAgentPlanner:
             
             if not content and role == "user" and "audio" in h and self.asr_engine:
                 audio_path = str(split_dir / h["audio"])
+                history_asr_started = time.perf_counter()
                 content = self.asr_engine.transcribe(audio_path)
+                history_asr_seconds += time.perf_counter() - history_asr_started
 
             if content:
                 messages.append({"role": role, "content": content})
@@ -92,13 +102,31 @@ class ZAICAgentPlanner:
         execution_failed = False
 
         for turn in range(max_turns):
+            turns_executed = turn + 1
             retry_count = 0
             max_retries = 2
             parsed_data = None
             is_valid = False
 
             while retry_count < max_retries:
+                call_started = time.perf_counter()
                 raw_output = self.llm_engine.generate(messages)
+                call_seconds = time.perf_counter() - call_started
+                engine_stats = getattr(
+                    self.llm_engine, "last_generation_stats", {}
+                )
+                llm_call_stats.append(
+                    {
+                        "turn": turn + 1,
+                        "retry": retry_count + 1,
+                        "call_seconds": call_seconds,
+                        "engine": (
+                            dict(engine_stats)
+                            if isinstance(engine_stats, dict)
+                            else {}
+                        ),
+                    }
+                )
                 is_valid, parsed_data, err_msg = self.parse_llm_output_strict(raw_output)
 
                 if is_valid:
@@ -120,7 +148,9 @@ class ZAICAgentPlanner:
             tool_name = tool_call.get("name")
             tool_args = tool_call.get("arguments", {})
 
+            validation_started = time.perf_counter()
             val_res = env.validate(tool_name, tool_args)
+            tool_validation_seconds += time.perf_counter() - validation_started
             if not val_res.get("ok", True):
                 self.last_schema_errors.append(
                     {
@@ -133,8 +163,26 @@ class ZAICAgentPlanner:
                 messages.append({"role": "user", "content": f"Lỗi tham số Tool: {val_res.get('error')}. Hãy sửa lại arguments."})
                 continue
 
+            execution_started = time.perf_counter()
             exec_res = env.call(tool_name, tool_args)
+            tool_execution_seconds += time.perf_counter() - execution_started
             messages.append({"role": "assistant", "content": json.dumps(parsed_data, ensure_ascii=False)})
             messages.append({"role": "user", "content": f"[Observation từ Tool {tool_name}]: {json.dumps(exec_res, ensure_ascii=False)}"})
 
-        return env.get_tool_calls(), env.get_state_hash()
+        tool_calls = env.get_tool_calls()
+        state_hash = env.get_state_hash()
+        self.last_performance_stats = {
+            "planner_seconds": time.perf_counter() - planner_started,
+            "history_asr_seconds": history_asr_seconds,
+            "llm_call_count": len(llm_call_stats),
+            "llm_seconds": sum(
+                call["call_seconds"] for call in llm_call_stats
+            ),
+            "tool_validation_seconds": tool_validation_seconds,
+            "tool_execution_seconds": tool_execution_seconds,
+            "turns_executed": turns_executed,
+            "schema_error_count": len(self.last_schema_errors),
+            "tool_call_count": len(tool_calls),
+            "llm_calls": llm_call_stats,
+        }
+        return tool_calls, state_hash

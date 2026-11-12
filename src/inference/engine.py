@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.inference.device import select_compute_device
@@ -39,6 +40,7 @@ class HuggingFaceEngine:
         self.device, device_name = select_compute_device(torch)
         self.max_input_tokens = max_input_tokens
         self.max_new_tokens = max_new_tokens
+        self.last_generation_stats: dict[str, float | int | str] = {}
         is_cuda = self.device.startswith("cuda")
 
         model_directory = Path(model_path)
@@ -50,6 +52,7 @@ class HuggingFaceEngine:
             if is_cuda
             else torch.float32
         )
+        self.model_dtype = str(model_dtype)
         device_map = {"": int(self.device.split(":")[1])} if is_cuda else None
 
         if adapter_config_path.is_file():
@@ -85,7 +88,7 @@ class HuggingFaceEngine:
             )
         self.model.eval()
         print(
-            f"[LLM] device={self.device} ({device_name}); dtype={model_dtype}",
+            f"[LLM] device={self.device} ({device_name}); dtype={self.model_dtype}",
             flush=True,
         )
 
@@ -213,11 +216,18 @@ class HuggingFaceEngine:
             dropped_messages += 1
 
     def generate(self, messages: list) -> str:
+        total_started = time.perf_counter()
+        prepare_started = time.perf_counter()
         inputs, input_token_count, dropped_messages = self._prepare_inputs(messages)
         is_cuda = self.device.startswith("cuda") and torch.cuda.is_available()
         if is_cuda:
+            torch.cuda.synchronize(self.device)
+        prepare_seconds = time.perf_counter() - prepare_started
+
+        if is_cuda:
             torch.cuda.reset_peak_memory_stats(self.device)
 
+        generation_started = time.perf_counter()
         try:
             with torch.inference_mode():
                 generated_ids = self.model.generate(
@@ -226,22 +236,60 @@ class HuggingFaceEngine:
                     do_sample=False,
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
-        finally:
-            memory_report = (
-                f"cuda_allocated={torch.cuda.memory_allocated(self.device) / 1024**3:.2f}GiB "
-                f"cuda_reserved={torch.cuda.memory_reserved(self.device) / 1024**3:.2f}GiB "
-                f"cuda_peak={torch.cuda.max_memory_allocated(self.device) / 1024**3:.2f}GiB"
-                if is_cuda
-                else f"device={self.device}"
-            )
+        except Exception:
+            generation_seconds = time.perf_counter() - generation_started
             print(
-                f"[LLM] input_tokens={input_token_count}/{self.max_input_tokens}; "
-                f"dropped_messages={dropped_messages}; {memory_report}",
+                f"[LLM_PERF] status=error; input_tokens={input_token_count}; "
+                f"prepare_seconds={prepare_seconds:.3f}; "
+                f"generation_seconds={generation_seconds:.3f}",
                 flush=True,
             )
+            raise
+
+        if is_cuda:
+            torch.cuda.synchronize(self.device)
+        generation_seconds = time.perf_counter() - generation_started
 
         generated_ids = [
             output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
         ]
-        
-        return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        decode_started = time.perf_counter()
+        output_text = self.tokenizer.batch_decode(
+            generated_ids, skip_special_tokens=True
+        )[0].strip()
+        decode_seconds = time.perf_counter() - decode_started
+        output_token_count = sum(output_ids.numel() for output_ids in generated_ids)
+        total_seconds = time.perf_counter() - total_started
+        self.last_generation_stats = {
+            "input_tokens": input_token_count,
+            "output_tokens": output_token_count,
+            "dropped_messages": dropped_messages,
+            "prepare_seconds": prepare_seconds,
+            "generation_seconds": generation_seconds,
+            "decode_seconds": decode_seconds,
+            "total_seconds": total_seconds,
+            "output_tokens_per_second": (
+                output_token_count / generation_seconds
+                if generation_seconds > 0
+                else 0.0
+            ),
+        }
+
+        if is_cuda:
+            memory_report = {
+                "cuda_allocated_gib": torch.cuda.memory_allocated(self.device)
+                / 1024**3,
+                "cuda_reserved_gib": torch.cuda.memory_reserved(self.device)
+                / 1024**3,
+                "cuda_peak_gib": torch.cuda.max_memory_allocated(self.device)
+                / 1024**3,
+            }
+        else:
+            memory_report = {"device": self.device}
+        self.last_generation_stats.update(memory_report)
+        print(
+            "[LLM_PERF] "
+            + json.dumps(self.last_generation_stats, ensure_ascii=False),
+            flush=True,
+        )
+        return output_text

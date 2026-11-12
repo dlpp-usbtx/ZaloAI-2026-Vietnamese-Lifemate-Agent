@@ -163,6 +163,14 @@ def test_generate_trims_old_messages_and_keeps_system_and_user_requests():
     assert "recent observation" in llm_engine.tokenizer.last_prompt
     assert "old history request" not in llm_engine.tokenizer.last_prompt
     assert "old assistant response" not in llm_engine.tokenizer.last_prompt
+    assert llm_engine.last_generation_stats["input_tokens"] == (
+        llm_engine.model.input_ids.shape[-1]
+    )
+    assert llm_engine.last_generation_stats["output_tokens"] == 1
+    assert llm_engine.last_generation_stats["generation_seconds"] >= 0
+    assert llm_engine.last_generation_stats["prepare_seconds"] >= 0
+    assert llm_engine.last_generation_stats["decode_seconds"] >= 0
+    assert llm_engine.last_generation_stats["device"] == "cpu"
 
 
 def test_generate_fails_when_required_messages_exceed_prompt_limit():

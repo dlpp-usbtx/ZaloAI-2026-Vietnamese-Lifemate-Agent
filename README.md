@@ -72,6 +72,7 @@ The notebook runs:
 python -u run_submission.py \
   --split public_test \
   --output /kaggle/working/submission.jsonl \
+  --performance-log /kaggle/working/lifemate_performance.jsonl \
   --resume
 ```
 
@@ -82,6 +83,14 @@ checkpoint attached as a Kaggle input, set `LIFEMATE_RESUME_FROM` to its
 `submission.jsonl` path in the notebook's configuration cell. The tokenizer
 compatibility fix is applied to a temporary tokenizer-only copy; the read-only
 adapter input is never modified.
+
+The runner writes a separate performance JSONL without changing the submission
+schema. It records per-sample ASR and planner durations, per-call prompt/output
+token counts, input preparation, generation and decoding times, tool
+validation/execution times, and GPU memory. Startup model-loading times are
+printed separately. The Kaggle notebook reports sample mean/p95/max, average
+LLM calls per sample, generation latency, and output-token counts after
+inference.
 
 ## Training and evaluation
 
