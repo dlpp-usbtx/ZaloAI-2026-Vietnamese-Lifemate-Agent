@@ -15,6 +15,7 @@ os.environ.setdefault(
 )
 
 import torch
+import transformers
 
 AGENT_DIR = Path(__file__).resolve().parent
 if str(AGENT_DIR) not in sys.path:
@@ -107,6 +108,24 @@ def _parse_args() -> argparse.Namespace:
         help="Maximum total LLM generate calls for each sample.",
     )
     parser.add_argument(
+        "--planner-mode",
+        choices=("react", "batch"),
+        default="react",
+        help=(
+            "react runs iterative tool feedback; batch plans ordered tool calls "
+            "in one generation."
+        ),
+    )
+    parser.add_argument(
+        "--max-available-tools",
+        type=int,
+        default=0,
+        help=(
+            "Keep only the highest lexical-relevance tools in the prompt; "
+            "0 keeps the full installed catalog."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Append missing samples to an existing output file.",
@@ -128,6 +147,8 @@ def main() -> None:
     args = _parse_args()
     if args.max_llm_calls < 1:
         raise ValueError("--max-llm-calls must be greater than zero.")
+    if args.max_available_tools < 0:
+        raise ValueError("--max-available-tools cannot be negative.")
     performance_log = args.performance_log or args.output.with_name(
         f"{args.output.stem}.performance.jsonl"
     )
@@ -192,6 +213,10 @@ def main() -> None:
         catalog_manager,
         asr_engine=asr_engine,
         max_llm_calls=args.max_llm_calls,
+        planning_mode=args.planner_mode,
+        max_available_tools=(
+            args.max_available_tools or None
+        ),
     )
 
     tools_directory = str(split_dir)
@@ -250,8 +275,48 @@ def main() -> None:
                 performance_record = {
                     "id": sample_id,
                     "asr_seconds": asr_seconds,
+                    "asr": {
+                        "audio_file": item["audio"],
+                        "transcript": item["transcribed_text"],
+                        "reference_transcript": (
+                            item.get("audio_text")
+                            if isinstance(item.get("audio_text"), str)
+                            else None
+                        ),
+                        "device": asr_engine.device,
+                        "device_name": getattr(
+                            asr_engine, "device_name", asr_engine.device
+                        ),
+                        "provider": getattr(asr_engine, "provider", None),
+                        "num_threads": getattr(asr_engine, "num_threads", None),
+                    },
                     "sample_seconds": sample_seconds,
+                    "context": {
+                        "current_time": item.get("context", {}).get(
+                            "current_time"
+                        ),
+                        "timezone": item.get("context", {}).get("timezone"),
+                    },
+                    "runtime": {
+                        "asr_model": getattr(asr_engine, "model_id", None),
+                        "asr_revision": getattr(asr_engine, "revision", None),
+                        "llm_model": getattr(
+                            llm_engine, "base_model_path", None
+                        ),
+                        "llm_device": llm_engine.device,
+                        "llm_device_name": getattr(
+                            llm_engine, "device_name", llm_engine.device
+                        ),
+                        "llm_dtype": llm_engine.model_dtype,
+                        "attention": llm_engine.attention_implementation,
+                        "planner_mode": args.planner_mode,
+                        "max_llm_calls": args.max_llm_calls,
+                        "max_available_tools": args.max_available_tools or None,
+                        "torch_version": torch.__version__,
+                        "transformers_version": transformers.__version__,
+                    },
                     "planner": planner.last_performance_stats,
+                    "schema_errors": planner.last_schema_errors,
                 }
                 performance_file.write(
                     json.dumps(performance_record, ensure_ascii=False) + "\n"

@@ -74,8 +74,30 @@ python -u run_submission.py \
   --output /kaggle/working/submission.jsonl \
   --performance-log /kaggle/working/lifemate_performance.jsonl \
   --max-llm-calls 2 \
+  --planner-mode react \
+  --max-available-tools 0 \
   --resume
 ```
+
+`--planner-mode react` retains tool feedback and iterative planning.
+`--planner-mode batch` asks for an ordered tool-call list and executes it after
+one generation; this can reduce latency for multi-tool requests, but its
+accuracy must be checked against validation because the exported adapter was
+trained on single-call turns.
+
+Compare both modes on the same validation IDs before using batch for a
+submission:
+
+```bash
+python testing/evaluate.py --planner-mode react --max-llm-calls 2
+python testing/evaluate.py --planner-mode batch --max-llm-calls 1
+python testing/evaluate.py --planner-mode batch --max-llm-calls 1 --max-available-tools 8
+```
+
+Use `--limit 8` for an initial quick comparison, then run without `--limit` to
+compare all 154 validation examples. Results are saved under distinct filenames
+and report tool-call F1/exact match, state match, planning latency, LLM call
+count, and budget exhaustion.
 
 The runner validates the dataset paths, writes each result immediately, checks
 resume JSONL files for malformed or duplicate IDs, skips completed samples, and
@@ -91,7 +113,14 @@ token counts, input preparation, generation and decoding times, tool
 validation/execution times, and GPU memory. Startup model-loading times are
 printed separately. The Kaggle notebook reports sample mean/p95/max, average
 LLM calls per sample, generation latency, and output-token counts after
-inference.
+inference. The sidecar also records the ASR transcript (and a reference when
+the input provides one), sample time context, selected model/device/dtype,
+available tool names, parser decisions, ordered proposed tool calls, and
+tool-result status keys for diagnosing ASR, planning, and execution issues.
+`--max-available-tools 0` preserves the full installed tool list; positive
+values enable a lightweight Vietnamese/English lexical relevance shortlist.
+Keep this disabled unless a validation comparison shows that the shortlist
+preserves tool-call accuracy.
 
 The default two-call budget bounds retries and multi-step tool planning; raise
 `MAX_LLM_CALLS_PER_SAMPLE` in the notebook if validation shows that complex

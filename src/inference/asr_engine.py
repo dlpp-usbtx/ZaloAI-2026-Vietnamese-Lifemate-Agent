@@ -84,6 +84,7 @@ class ASREngine:
         self.revision = revision
         self.num_threads = num_threads
         self.device, device_name = select_compute_device(torch)
+        self.device_name = device_name
         model_files = {
             key: hf_hub_download(
                 repo_id=model_id,
@@ -107,10 +108,12 @@ class ASREngine:
                 flush=True,
             )
             self.device = "cpu"
+            self.device_name = "CPU (CUDA provider unavailable)"
             self.recognizer = self._create_recognizer(
                 sherpa_onnx, model_files, "cpu"
             )
             provider = "cpu"
+        self.provider = provider
         print(
             f"[ASR] model={model_id}@{revision}; "
             f"device={self.device}; provider={provider}",

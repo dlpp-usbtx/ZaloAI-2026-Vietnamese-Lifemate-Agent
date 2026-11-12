@@ -4,8 +4,27 @@ Lọc chính xác danh sách tools được cài đặt cho từng sample, phát
 """
 
 import json
+import math
 from pathlib import Path
+import re
+import unicodedata
+from collections import Counter
 from typing import Dict, Any, List
+
+
+def _tokens(text: str) -> set[str]:
+    normalized = unicodedata.normalize("NFD", text.lower()).replace("đ", "d")
+    normalized = "".join(
+        character
+        for character in normalized
+        if not unicodedata.combining(character)
+    )
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", normalized)
+        if len(token) > 1
+    }
+
 
 SYS_ASK_MISSING_INFO_SCHEMA = {
     "name": "sys.ask_missing_info",
@@ -72,3 +91,48 @@ class CatalogManager:
                 tools_list.append(self.all_tools[name])
 
         return tools_list
+
+    def select_relevant_tools(
+        self,
+        tools: List[Dict[str, Any]],
+        query: str,
+        max_tools: int,
+    ) -> List[Dict[str, Any]]:
+        """Shortlist installed tools by Vietnamese/English token overlap."""
+        if max_tools < 1:
+            raise ValueError("max_tools must be greater than zero.")
+
+        system_tools = [tool for tool in tools if tool.get("name") == "sys.ask_missing_info"]
+        candidates = [
+            tool for tool in tools if tool.get("name") != "sys.ask_missing_info"
+        ]
+        if len(candidates) <= max_tools:
+            return tools
+
+        candidate_tokens = [
+            _tokens(json.dumps(tool, ensure_ascii=False)) for tool in candidates
+        ]
+        query_tokens = _tokens(query)
+        document_frequency = Counter(
+            token for tokens in candidate_tokens for token in tokens
+        )
+        scores = [
+            sum(
+                math.log(
+                    1
+                    + (len(candidates) - document_frequency[token] + 0.5)
+                    / (document_frequency[token] + 0.5)
+                )
+                for token in query_tokens.intersection(tokens)
+            )
+            for tokens in candidate_tokens
+        ]
+        if not any(scores):
+            return tools
+
+        ranked_indexes = sorted(
+            range(len(candidates)),
+            key=lambda index: (-scores[index], index),
+        )[:max_tools]
+        selected = [candidates[index] for index in ranked_indexes]
+        return system_tools + selected

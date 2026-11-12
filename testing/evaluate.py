@@ -11,7 +11,9 @@ import argparse
 from collections import Counter
 import copy
 import json
+import math
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -219,9 +221,31 @@ def run_evaluation() -> None:
         action="store_true",
         help="Evaluate the base model instead of the configured SFT adapter.",
     )
+    parser.add_argument(
+        "--planner-mode",
+        choices=("react", "batch"),
+        default="react",
+        help="Compare iterative ReAct planning with one-pass batched planning.",
+    )
+    parser.add_argument(
+        "--max-llm-calls",
+        type=int,
+        default=2,
+        help="Maximum LLM generate calls for each validation example.",
+    )
+    parser.add_argument(
+        "--max-available-tools",
+        type=int,
+        default=0,
+        help="Limit tools in the prompt by lexical relevance; 0 keeps all installed tools.",
+    )
     args = parser.parse_args()
     if args.base_model and args.require_checkpoint:
         parser.error("--base-model cannot be combined with --require-checkpoint.")
+    if args.max_llm_calls < 1:
+        parser.error("--max-llm-calls must be greater than zero.")
+    if args.max_available_tools < 0:
+        parser.error("--max-available-tools cannot be negative.")
 
     validation_items = _load_validation_items()
     selected_items, force_asr_ids = _select_items(
@@ -245,7 +269,12 @@ def run_evaluation() -> None:
     llm_engine = HuggingFaceEngine(model_path=model_path)
     catalog_manager = CatalogManager(SPLIT_DIR / "train_tools_catalog.json")
     planner = ZAICAgentPlanner(
-        llm_engine, catalog_manager, asr_engine=asr_engine
+        llm_engine,
+        catalog_manager,
+        asr_engine=asr_engine,
+        max_llm_calls=args.max_llm_calls,
+        planning_mode=args.planner_mode,
+        max_available_tools=args.max_available_tools or None,
     )
 
     exact_matches = 0
@@ -254,10 +283,20 @@ def run_evaluation() -> None:
     f1_sum = 0.0
     state_matches = 0
     invalid_schema_calls = 0
+    sample_seconds = []
+    llm_call_counts = []
+    budget_reached_count = 0
 
     output_dir = BASE_DIR / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
-    predictions_path = output_dir / "validation_predictions.jsonl"
+    predictions_path = output_dir / (
+        f"validation_predictions_{args.planner_mode}_calls{args.max_llm_calls}"
+        f"_tools{args.max_available_tools or 'all'}.jsonl"
+    )
+    metrics_path = output_dir / (
+        f"validation_metrics_{args.planner_mode}_calls{args.max_llm_calls}"
+        f"_tools{args.max_available_tools or 'all'}.json"
+    )
 
     with predictions_path.open("w", encoding="utf-8") as prediction_file:
         for index, original_item in enumerate(selected_items, start=1):
@@ -270,6 +309,7 @@ def run_evaluation() -> None:
             # planning/tool use; the smoke history case separately tests ASR.
             item["transcribed_text"] = item.get("audio_text", "")
 
+            sample_started = time.perf_counter()
             env = ToolEnv(SPLIT, item["id"], root=SPLIT_DIR.parent)
             initial_state = env.get_state()
             predicted_calls, planner_hash = planner.process_sample(
@@ -290,6 +330,7 @@ def run_evaluation() -> None:
             )
             exact = predicted_calls == expected_calls
             schema_errors = list(planner.last_schema_errors)
+            elapsed = time.perf_counter() - sample_started
 
             exact_matches += exact
             precision_sum += precision
@@ -297,6 +338,13 @@ def run_evaluation() -> None:
             f1_sum += f1
             state_matches += matches_state
             invalid_schema_calls += len(schema_errors)
+            sample_seconds.append(elapsed)
+            llm_call_counts.append(
+                planner.last_performance_stats["llm_call_count"]
+            )
+            budget_reached_count += bool(
+                planner.last_performance_stats["llm_call_budget_reached"]
+            )
 
             prediction = {
                 "id": item["id"],
@@ -311,6 +359,8 @@ def run_evaluation() -> None:
                 "expected_state_hash": expected_hash,
                 "actual_state_hash": actual_hash,
                 "planner_state_hash": planner_hash,
+                "sample_seconds": elapsed,
+                "planner_performance": planner.last_performance_stats,
             }
             prediction_file.write(
                 json.dumps(prediction, ensure_ascii=False) + "\n"
@@ -329,7 +379,34 @@ def run_evaluation() -> None:
     print(f"  Macro F1:               {f1_sum / count:.2%}")
     print(f"  Schema-invalid attempts: {invalid_schema_calls}")
     print(f"  State match:            {state_matches / count:.2%}")
+    ordered_times = sorted(sample_seconds)
+    p95_index = min(count - 1, math.ceil(0.95 * count) - 1)
+    print(f"  Planner mean/p95:       {sum(sample_seconds) / count:.2f}s / {ordered_times[p95_index]:.2f}s")
+    print(f"  Mean LLM calls:         {sum(llm_call_counts) / count:.2f}")
+    print(f"  LLM budget reached:     {budget_reached_count / count:.2%}")
     print(f"  Per-example results:    {predictions_path}")
+    metrics = {
+        "examples": count,
+        "planner_mode": args.planner_mode,
+        "max_llm_calls": args.max_llm_calls,
+        "max_available_tools": args.max_available_tools or None,
+        "ordered_exact_match": exact_matches / count,
+        "macro_precision": precision_sum / count,
+        "macro_recall": recall_sum / count,
+        "macro_f1": f1_sum / count,
+        "schema_invalid_attempts": invalid_schema_calls,
+        "state_match_rate": state_matches / count,
+        "planner_mean_seconds": sum(sample_seconds) / count,
+        "planner_p95_seconds": ordered_times[p95_index],
+        "mean_llm_calls": sum(llm_call_counts) / count,
+        "llm_budget_reached_rate": budget_reached_count / count,
+        "predictions_path": str(predictions_path),
+    }
+    metrics_path.write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"  Metrics:                {metrics_path}")
 
 
 if __name__ == "__main__":

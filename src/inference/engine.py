@@ -55,6 +55,43 @@ LLM_RESPONSE_SCHEMA = {
         },
     ]
 }
+LLM_BATCH_RESPONSE_SCHEMA = {
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {
+                "thought": {"type": "string"},
+                "action": {"enum": ["call_tool"]},
+                "tool_calls": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "arguments": {"type": "object"},
+                        },
+                        "required": ["name", "arguments"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["thought", "action", "tool_calls"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "thought": {"type": "string"},
+                "action": {"enum": ["final_response"]},
+                "content": {"type": "string"},
+            },
+            "required": ["thought", "action", "content"],
+            "additionalProperties": False,
+        },
+    ]
+}
 VIETNAMESE_TEXT_CHARACTERS = "".join(
     chr(codepoint)
     for start, end in ((0x00C0, 0x0250), (0x0300, 0x0370), (0x1E00, 0x1F00))
@@ -62,11 +99,13 @@ VIETNAMESE_TEXT_CHARACTERS = "".join(
 )
 
 
-def _create_response_parser() -> JsonSchemaParser:
+def _create_response_parser(
+    response_schema=LLM_RESPONSE_SCHEMA,
+) -> JsonSchemaParser:
     config = CharacterLevelParserConfig(
         alphabet=COMPLETE_ALPHABET + VIETNAMESE_TEXT_CHARACTERS
     )
-    return JsonSchemaParser(LLM_RESPONSE_SCHEMA, config=config)
+    return JsonSchemaParser(response_schema, config=config)
 
 
 def set_deterministic_seed(seed: int = 42):
@@ -92,6 +131,9 @@ class HuggingFaceEngine:
 
         set_deterministic_seed(42)
         self.device, device_name = select_compute_device(torch)
+        self.device_name = device_name
+        self.model_path = model_path
+        self.base_model_path = model_path
         self.max_input_tokens = max_input_tokens
         self.max_new_tokens = max_new_tokens
         self.last_generation_stats: dict[str, float | int | str] = {}
@@ -118,6 +160,7 @@ class HuggingFaceEngine:
                     f"Adapter config does not specify base_model_name_or_path: "
                     f"{adapter_config_path}"
                 )
+            self.base_model_path = base_model_path
             tokenizer_path = self._prepare_tokenizer_path(model_directory)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_path, trust_remote_code=True
@@ -129,6 +172,7 @@ class HuggingFaceEngine:
                 base_model_path,
                 torch_dtype=model_dtype,
                 device_map=device_map,
+                low_cpu_mem_usage=True,
                 attn_implementation=self.attention_implementation,
                 trust_remote_code=True,
             )
@@ -146,6 +190,7 @@ class HuggingFaceEngine:
                 model_path,
                 torch_dtype=model_dtype,
                 device_map=device_map,
+                low_cpu_mem_usage=True,
                 attn_implementation=self.attention_implementation,
                 trust_remote_code=True,
             )
@@ -280,13 +325,15 @@ class HuggingFaceEngine:
             del messages_to_encode[removable_index]
             dropped_messages += 1
 
-    def _build_prefix_allowed_tokens_fn(self):
-        parser = _create_response_parser()
+    def _build_prefix_allowed_tokens_fn(self, response_schema=LLM_RESPONSE_SCHEMA):
+        parser = _create_response_parser(response_schema)
         return build_transformers_prefix_allowed_tokens_fn(
             self._format_enforcer_tokenizer_data, parser
         )
 
-    def generate(self, messages: list) -> str:
+    def generate(
+        self, messages: list, response_schema=LLM_RESPONSE_SCHEMA
+    ) -> str:
         total_started = time.perf_counter()
         prepare_started = time.perf_counter()
         inputs, input_token_count, dropped_messages = self._prepare_inputs(messages)
@@ -299,7 +346,9 @@ class HuggingFaceEngine:
             torch.cuda.reset_peak_memory_stats(self.device)
 
         generation_started = time.perf_counter()
-        prefix_allowed_tokens_fn = self._build_prefix_allowed_tokens_fn()
+        prefix_allowed_tokens_fn = self._build_prefix_allowed_tokens_fn(
+            response_schema
+        )
         try:
             with torch.inference_mode():
                 generated_ids = self.model.generate(

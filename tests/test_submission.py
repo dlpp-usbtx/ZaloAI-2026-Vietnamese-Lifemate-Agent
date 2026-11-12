@@ -83,12 +83,17 @@ def test_main_writes_performance_log_separately_from_submission(
 
     class FakeASREngine:
         device = "cpu"
+        device_name = "CPU"
+        model_id = "zipformer"
+        revision = "test"
 
         def transcribe(self, audio_path):
             return "recognized request"
 
     class FakeLLMEngine:
         device = "cpu"
+        device_name = "CPU"
+        base_model_path = "base-model"
         model_dtype = "torch.float32"
         attention_implementation = "sdpa"
         max_input_tokens = 8192
@@ -118,6 +123,7 @@ def test_main_writes_performance_log_separately_from_submission(
                     }
                 ],
             }
+            self.last_schema_errors = []
 
         def process_sample(self, item, env, sample_dir):
             return [{"name": "tool"}], "state-hash"
@@ -157,4 +163,8 @@ def test_main_writes_performance_log_separately_from_submission(
     assert submission["id"] == "sample-1"
     performance = json.loads(performance_path.read_text(encoding="utf-8"))
     assert performance["id"] == "sample-1"
+    assert performance["asr"]["transcript"] == "recognized request"
+    assert performance["asr"]["reference_transcript"] is None
+    assert performance["runtime"]["planner_mode"] == "react"
+    assert performance["schema_errors"] == []
     assert performance["planner"]["llm_calls"][0]["engine"]["output_tokens"] == 5

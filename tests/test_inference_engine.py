@@ -102,6 +102,7 @@ def test_engine_loads_adapter_on_its_configured_base(tmp_path, monkeypatch):
     assert tokenizer_calls[0][0] == str(adapter_dir)
     assert base_model_calls[0][0] == "Qwen/Qwen2.5-3B-Instruct"
     assert base_model_calls[0][1]["attn_implementation"] == "sdpa"
+    assert base_model_calls[0][1]["low_cpu_mem_usage"] is True
     assert loaded._format_enforcer_tokenizer_data == ("tokenizer-data", tokenizer)
     assert adapter_calls == [
         (base_model, str(adapter_dir), {"is_trainable": False})
@@ -242,3 +243,23 @@ def test_json_response_schema_accepts_both_training_actions():
             ensure_ascii=False,
         )
     )
+
+
+def test_batch_json_schema_accepts_ordered_tool_calls():
+    response = json.dumps(
+        {
+            "thought": "Thực hiện lần lượt.",
+            "action": "call_tool",
+            "tool_calls": [
+                {"name": "calendar.create", "arguments": {"title": "A"}},
+                {"name": "reminders.create", "arguments": {"content": "B"}},
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    parser = engine._create_response_parser(engine.LLM_BATCH_RESPONSE_SCHEMA)
+    for character in response:
+        parser = parser.add_character(character)
+
+    assert parser.can_end()
