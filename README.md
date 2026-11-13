@@ -64,7 +64,10 @@ Enable Internet to install dependencies and download the base Qwen model and
 pinned ZipFormer files. Select an A30 accelerator when available; otherwise use
 a T4. The notebook tries compatible CUDA-enabled sherpa-onnx wheels and falls
 back to the standard CPU wheel if unavailable. It preserves Kaggle's installed
-PyTorch/CUDA/torchaudio versions.
+PyTorch/CUDA/torchaudio versions. Its Kaggle requirements constrain
+`tokenizers` to `>=0.20,<0.22`, which is compatible with the selected
+Transformers versions and replaces incompatible newer Kaggle preinstalls
+without changing the PyTorch/CUDA stack.
 
 The notebook runs:
 
